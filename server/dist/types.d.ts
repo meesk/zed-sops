@@ -14,6 +14,8 @@ export interface FileContext {
     decryptedFilePath: string;
     /** File type for sops --input-type/--output-type */
     fileType: SopsFileType;
+    /** Set when the sidecar was reopened while still tracked */
+    reopenedAt?: number;
 }
 export type SopsFileType = "yaml" | "json" | "ini" | "dotenv" | "binary";
 export interface SopsConfig {

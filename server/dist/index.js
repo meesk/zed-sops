@@ -51,6 +51,7 @@ process.on("unhandledRejection", (reason) => {
 const connection = (0, node_1.createConnection)(node_1.ProposedFeatures.all);
 const documents = new node_1.TextDocuments(vscode_languageserver_textdocument_1.TextDocument);
 const stateManager = new file_state_1.FileStateManager();
+const OPEN_COMMAND = "sops.openDecrypted";
 let sopsRunner;
 connection.onInitialize((params) => {
     const opts = params.initializationOptions || {};
@@ -65,6 +66,8 @@ connection.onInitialize((params) => {
                 change: node_1.TextDocumentSyncKind.Full,
                 save: { includeText: true },
             },
+            codeActionProvider: { codeActionKinds: [node_1.CodeActionKind.Empty] },
+            executeCommandProvider: { commands: [OPEN_COMMAND] },
         },
     };
 });
@@ -123,14 +126,29 @@ documents.onDidOpen(async (event) => {
     if (!(0, sops_detector_1.isSopsEncrypted)(content, fileType)) {
         return;
     }
+    await openSidecar(filePath, content, fileType);
+});
+/**
+ * Decrypt an encrypted file into its .decrypted~ sidecar and open it.
+ * If the sidecar is already open, just bring it to the front.
+ */
+async function openSidecar(filePath, content, fileType) {
     const decryptedFilePath = (0, sops_detector_1.getDecryptedPath)(filePath);
     const decryptedUri = filePathToUri(decryptedFilePath);
     try {
-        const decryptedContent = await sopsRunner.decrypt(filePath, fileType);
-        // Write the sidecar to disk
-        await fs.writeFile(decryptedFilePath, decryptedContent, "utf-8");
-        // Track state by the sidecar URI
-        stateManager.init(decryptedUri, filePath, content, decryptedFilePath, fileType);
+        let decryptedContent;
+        const existing = stateManager.get(decryptedUri);
+        if (existing) {
+            // Zed may not have sent didClose for the previous tab yet; it must not delete the file we reopen now.
+            existing.reopenedAt = Date.now();
+            decryptedContent = await sopsRunner.decrypt(filePath, fileType);
+            await fs.writeFile(decryptedFilePath, decryptedContent, "utf-8");
+        }
+        else {
+            decryptedContent = await sopsRunner.decrypt(filePath, fileType);
+            await fs.writeFile(decryptedFilePath, decryptedContent, "utf-8");
+            stateManager.init(decryptedUri, filePath, content, decryptedFilePath, fileType);
+        }
         // Open the sidecar in Zed via workspace/applyEdit (CreateFile + TextDocumentEdit)
         const opened = await openDecryptedFile(decryptedUri, decryptedFilePath, decryptedContent);
         if (opened) {
@@ -148,6 +166,28 @@ documents.onDidOpen(async (event) => {
         const msg = error instanceof Error ? error.message : String(error);
         connection.window.showErrorMessage(`SOPS decrypt failed: ${msg}`);
     }
+}
+connection.onCodeAction((params) => {
+    const document = documents.get(params.textDocument.uri);
+    if (!document || (0, sops_detector_1.isDecryptedFile)(uriToFilePath(document.uri)))
+        return [];
+    if (!(0, sops_detector_1.isSopsEncrypted)(document.getText(), (0, sops_detector_1.detectFileType)(document.uri)))
+        return [];
+    return [
+        {
+            title: "SOPS: Open decrypted file",
+            kind: node_1.CodeActionKind.Empty,
+            command: { title: "SOPS: Open decrypted file", command: OPEN_COMMAND, arguments: [document.uri] },
+        },
+    ];
+});
+connection.onExecuteCommand(async (params) => {
+    if (params.command !== OPEN_COMMAND)
+        return;
+    const document = documents.get(params.arguments?.[0]);
+    if (!document)
+        return;
+    await openSidecar(uriToFilePath(document.uri), document.getText(), (0, sops_detector_1.detectFileType)(document.uri));
 });
 /**
  * On save of a .decrypted~ sidecar: re-encrypt the original file.
@@ -189,6 +229,8 @@ documents.onDidClose(async (event) => {
     const ctx = stateManager.get(uri);
     if (!ctx)
         return;
+    if (ctx.reopenedAt && Date.now() - ctx.reopenedAt < 5000)
+        return; // late didClose of the previous tab
     // Delete the sidecar file (plaintext cleanup)
     await fs.unlink(ctx.decryptedFilePath).catch(() => { });
     connection.console.log(`SOPS: Deleted sidecar ${ctx.decryptedFilePath}`);
@@ -209,12 +251,19 @@ async function openDecryptedFile(decryptedUri, decryptedFilePath, content) {
         const lastChar = lines[lastLine].length;
         const result = await connection.workspace.applyEdit({
             documentChanges: [
-                node_1.CreateFile.create(decryptedUri, { overwrite: true }),
+                node_1.CreateFile.create(decryptedUri, { ignoreIfExists: true }),
                 node_1.TextDocumentEdit.create(node_1.OptionalVersionedTextDocumentIdentifier.create(decryptedUri, null), [
                     node_1.TextEdit.replace(node_1.Range.create(node_1.Position.create(0, 0), node_1.Position.create(lastLine, lastChar)), content),
                 ]),
             ],
         });
+        if (result.applied) {
+            // Best effort: bring the tab to the front (applyEdit leaves it in the background).
+            const shown = await connection.window
+                .showDocument({ uri: decryptedUri, takeFocus: true })
+                .catch(() => ({ success: false }));
+            connection.console.log(`SOPS: showDocument success=${shown.success}`);
+        }
         return result.applied;
     }
     catch (error) {
